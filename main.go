@@ -39,6 +39,7 @@ var (
 	disallowAdditionalProperties bool = false
 	disallowBigIntsAsStrings     bool = false
 	debugLogging                 bool = false
+	addSchemaProperty            bool = false
 	globalPkg                         = &ProtoPackage{
 		name:     "",
 		parent:   nil,
@@ -70,6 +71,7 @@ func init() {
 	flag.BoolVar(&disallowAdditionalProperties, "disallow_additional_properties", false, "Disallow additional properties")
 	flag.BoolVar(&disallowBigIntsAsStrings, "disallow_bigints_as_strings", false, "Disallow bigints to be strings (eg scientific notation)")
 	flag.BoolVar(&debugLogging, "debug", false, "Log debug messages")
+	flag.BoolVar(&addSchemaProperty, "add_schema_property", false, "Add $schema property to all messages")
 }
 
 func logWithLevel(logLevel LogLevel, logFormat string, logParams ...interface{}) {
@@ -271,12 +273,13 @@ func convertField(curPkg *ProtoPackage, desc *descriptor.FieldDescriptorProto, m
 	case descriptor.FieldDescriptorProto_TYPE_GROUP,
 		descriptor.FieldDescriptorProto_TYPE_MESSAGE:
 		jsonSchemaType.Type = gojsonschema.TYPE_OBJECT
-		if desc.GetLabel() == descriptor.FieldDescriptorProto_LABEL_OPTIONAL {
-			jsonSchemaType.AdditionalProperties = []byte("true")
-		}
-		if desc.GetLabel() == descriptor.FieldDescriptorProto_LABEL_REQUIRED {
-			jsonSchemaType.AdditionalProperties = []byte("false")
-		}
+		//if desc.GetLabel() == descriptor.FieldDescriptorProto_LABEL_OPTIONAL {
+		//	jsonSchemaType.AdditionalProperties = []byte("true")
+		//}
+		//if desc.GetLabel() == descriptor.FieldDescriptorProto_LABEL_REQUIRED {
+		//	jsonSchemaType.AdditionalProperties = []byte("false")
+		//}
+		jsonSchemaType.AdditionalProperties = []byte("false")
 
 	default:
 		return nil, fmt.Errorf("unrecognized field type: %s", desc.GetType().String())
@@ -370,6 +373,13 @@ func convertMessageType(curPkg *ProtoPackage, msg *descriptor.DescriptorProto) (
 		jsonSchemaType.AdditionalProperties = []byte("true")
 	}
 
+	if addSchemaProperty {
+		jsonSchemaType.Properties["$schema"] = &jsonschema.Type{
+			Type:   "string",
+			Format: "uri",
+		}
+	}
+
 	logWithLevel(LOG_DEBUG, "Converting message: %s", proto.MarshalTextString(msg))
 	for _, fieldDesc := range msg.GetField() {
 		recursedJSONSchemaType, err := convertField(curPkg, fieldDesc, msg)
@@ -377,7 +387,8 @@ func convertMessageType(curPkg *ProtoPackage, msg *descriptor.DescriptorProto) (
 			logWithLevel(LOG_ERROR, "Failed to convert field %s in %s: %v", fieldDesc.GetName(), msg.GetName(), err)
 			return jsonSchemaType, err
 		}
-		jsonSchemaType.Properties[fieldDesc.GetName()] = recursedJSONSchemaType
+		//jsonSchemaType.Properties[fieldDesc.GetName()] = recursedJSONSchemaType
+		jsonSchemaType.Properties[*fieldDesc.JsonName] = recursedJSONSchemaType
 	}
 	return jsonSchemaType, nil
 }
@@ -414,10 +425,10 @@ func convertFile(file *descriptor.FileDescriptorProto) ([]*plugin.CodeGeneratorR
 
 	// Warn about multiple messages / enums in files:
 	if len(file.GetMessageType()) > 1 {
-		logWithLevel(LOG_WARN, "protoc-gen-jsonschema will create multiple MESSAGE schemas (%d) from one proto file (%v)", len(file.GetMessageType()), protoFileName)
+		logWithLevel(LOG_INFO, "protoc-gen-jsonschema will create multiple MESSAGE schemas (%d) from one proto file (%v)", len(file.GetMessageType()), protoFileName)
 	}
 	if len(file.GetEnumType()) > 1 {
-		logWithLevel(LOG_WARN, "protoc-gen-jsonschema will create multiple ENUM schemas (%d) from one proto file (%v)", len(file.GetEnumType()), protoFileName)
+		logWithLevel(LOG_INFO, "protoc-gen-jsonschema will create multiple ENUM schemas (%d) from one proto file (%v)", len(file.GetEnumType()), protoFileName)
 	}
 
 	// Generate standalone ENUMs:
@@ -452,7 +463,7 @@ func convertFile(file *descriptor.FileDescriptorProto) ([]*plugin.CodeGeneratorR
 			return nil, fmt.Errorf("no such package found: %s", file.GetPackage())
 		}
 		for _, msg := range file.GetMessageType() {
-			jsonSchemaFileName := fmt.Sprintf("%s.jsonschema", msg.GetName())
+			jsonSchemaFileName := fmt.Sprintf("%s.schema.json", msg.GetName())
 			logWithLevel(LOG_INFO, "Generating JSON-schema for MESSAGE (%v) in file [%v] => %v", msg.GetName(), protoFileName, jsonSchemaFileName)
 			messageJSONSchema, err := convertMessageType(pkg, msg)
 			if err != nil {
@@ -538,6 +549,8 @@ func commandLineParameter(parameters string) {
 			disallowAdditionalProperties = true
 		case "disallow_bigints_as_strings":
 			disallowBigIntsAsStrings = true
+		case "add_schema_property":
+			addSchemaProperty = true
 		}
 	}
 }
