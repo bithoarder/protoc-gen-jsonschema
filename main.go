@@ -11,18 +11,17 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"github.com/alecthomas/jsonschema"
+	"github.com/golang/protobuf/proto"
+	"github.com/golang/protobuf/protoc-gen-go/descriptor"
+	plugin "github.com/golang/protobuf/protoc-gen-go/plugin"
+	"github.com/xeipuuv/gojsonschema"
 	"io"
 	"io/ioutil"
 	"log"
 	"os"
 	"path"
 	"strings"
-
-	"github.com/alecthomas/jsonschema"
-	"github.com/golang/protobuf/proto"
-	"github.com/golang/protobuf/protoc-gen-go/descriptor"
-	plugin "github.com/golang/protobuf/protoc-gen-go/plugin"
-	"github.com/xeipuuv/gojsonschema"
 )
 
 const (
@@ -58,10 +57,11 @@ var (
 
 // ProtoPackage describes a package of Protobuf, which is an container of message types.
 type ProtoPackage struct {
-	name     string
-	parent   *ProtoPackage
-	children map[string]*ProtoPackage
-	types    map[string]*descriptor.DescriptorProto
+	name      string
+	parent    *ProtoPackage
+	children  map[string]*ProtoPackage
+	types     map[string]*descriptor.DescriptorProto
+	enumTypes map[string]*descriptor.EnumDescriptorProto
 }
 
 type LogLevel int
@@ -85,33 +85,56 @@ func logWithLevel(logLevel LogLevel, logFormat string, logParams ...interface{})
 	log.Printf(fmt.Sprintf("[%v] %v", logLevels[logLevel], logMessage))
 }
 
-func registerType(pkgName *string, msg *descriptor.DescriptorProto) {
-	pkg := globalPkg
-	if pkgName != nil {
-		for _, node := range strings.Split(*pkgName, ".") {
-			if pkg == globalPkg && node == "" {
-				// Skips leading "."
-				continue
-			}
-			child, ok := pkg.children[node]
-			if !ok {
-				child = &ProtoPackage{
-					name:     pkg.name + "." + node,
-					parent:   pkg,
-					children: make(map[string]*ProtoPackage),
-					types:    make(map[string]*descriptor.DescriptorProto),
-				}
-				pkg.children[node] = child
-			}
-			pkg = child
+func (pkg *ProtoPackage) getChildPkg(pkgName string) *ProtoPackage {
+	if child, has := pkg.children[pkgName]; has {
+		return child
+	} else if parts := strings.SplitN(pkgName, ".", 2); len(parts) == 2 {
+		return pkg.getChildPkg(parts[0]).getChildPkg(parts[1])
+	} else {
+		child := &ProtoPackage{
+			name:      pkg.name + "." + pkgName,
+			parent:    pkg,
+			children:  make(map[string]*ProtoPackage),
+			types:     make(map[string]*descriptor.DescriptorProto),
+			enumTypes: make(map[string]*descriptor.EnumDescriptorProto),
 		}
+
+		pkg.children[pkgName] = child
+		return child
 	}
+}
+
+func (pkg *ProtoPackage) registerType(msg *descriptor.DescriptorProto) {
 	pkg.types[msg.GetName()] = msg
+
+	for _, enum := range msg.GetEnumType() {
+		pkg.getChildPkg(msg.GetName()).enumTypes[enum.GetName()] = enum
+	}
+
+	for _, type_ := range msg.NestedType {
+		pkg.getChildPkg(msg.GetName()).registerType(type_)
+	}
+}
+
+func registerFile(file *descriptor.FileDescriptorProto) {
+	logWithLevel(LOG_DEBUG, "Loading types package %s", file.GetPackage())
+
+	pkg := globalPkg.getChildPkg(file.GetPackage())
+
+	for _, msg := range file.GetMessageType() {
+		logWithLevel(LOG_DEBUG, "Loading a message type %s from package %s", msg.GetName(), file.GetPackage())
+		pkg.registerType(msg)
+	}
+
+	for _, enum := range file.GetEnumType() {
+		logWithLevel(LOG_DEBUG, "Loading a enum type %s from package %s", enum.GetName(), file.GetPackage())
+		pkg.enumTypes[enum.GetName()] = enum
+	}
 }
 
 func (pkg *ProtoPackage) lookupType(name string) (*descriptor.DescriptorProto, bool) {
 	if strings.HasPrefix(name, ".") {
-		return globalPkg.relativelyLookupType(name[1:len(name)])
+		return globalPkg.relativelyLookupType(name[1:])
 	}
 
 	for ; pkg != nil; pkg = pkg.parent {
@@ -122,20 +145,17 @@ func (pkg *ProtoPackage) lookupType(name string) (*descriptor.DescriptorProto, b
 	return nil, false
 }
 
-func relativelyLookupNestedType(desc *descriptor.DescriptorProto, name string) (*descriptor.DescriptorProto, bool) {
-	components := strings.Split(name, ".")
-componentLoop:
-	for _, component := range components {
-		for _, nested := range desc.GetNestedType() {
-			if nested.GetName() == component {
-				desc = nested
-				continue componentLoop
-			}
-		}
-		logWithLevel(LOG_INFO, "no such nested message %s in %s", component, desc.GetName())
-		return nil, false
+func (pkg *ProtoPackage) lookupEnumType(name string) (*descriptor.EnumDescriptorProto, bool) {
+	if strings.HasPrefix(name, ".") {
+		return globalPkg.relativelyLookupEnumType(name[1:])
 	}
-	return desc, true
+
+	for ; pkg != nil; pkg = pkg.parent {
+		if desc, ok := pkg.relativelyLookupEnumType(name); ok {
+			return desc, ok
+		}
+	}
+	return nil, false
 }
 
 func (pkg *ProtoPackage) relativelyLookupType(name string) (*descriptor.DescriptorProto, bool) {
@@ -150,12 +170,29 @@ func (pkg *ProtoPackage) relativelyLookupType(name string) (*descriptor.Descript
 	case 2:
 		logWithLevel(LOG_DEBUG, "looking for %s in %s at %s (%v)", components[1], components[0], pkg.name, pkg)
 		if child, ok := pkg.children[components[0]]; ok {
-			found, ok := child.relativelyLookupType(components[1])
-			return found, ok
+			return child.relativelyLookupType(components[1])
 		}
-		if msg, ok := pkg.types[components[0]]; ok {
-			found, ok := relativelyLookupNestedType(msg, components[1])
-			return found, ok
+		logWithLevel(LOG_INFO, "no such package nor message %s in %s", components[0], pkg.name)
+		return nil, false
+	default:
+		logWithLevel(LOG_FATAL, "not reached")
+		return nil, false
+	}
+}
+
+func (pkg *ProtoPackage) relativelyLookupEnumType(name string) (*descriptor.EnumDescriptorProto, bool) {
+	components := strings.SplitN(name, ".", 2)
+	switch len(components) {
+	case 0:
+		logWithLevel(LOG_DEBUG, "empty message name")
+		return nil, false
+	case 1:
+		found, ok := pkg.enumTypes[components[0]]
+		return found, ok
+	case 2:
+		logWithLevel(LOG_DEBUG, "looking for %s in %s at %s (%v)", components[1], components[0], pkg.name, pkg)
+		if child, ok := pkg.children[components[0]]; ok {
+			return child.relativelyLookupEnumType(components[1])
 		}
 		logWithLevel(LOG_INFO, "no such package nor message %s in %s", components[0], pkg.name)
 		return nil, false
@@ -243,21 +280,13 @@ func convertField(curPkg *ProtoPackage, desc *descriptor.FieldDescriptorProto, m
 			jsonSchemaType.OneOf = append(jsonSchemaType.OneOf, &jsonschema.Type{Type: gojsonschema.TYPE_NULL})
 		}
 
-		// Go through all the enums we have, see if we can match any to this field by name:
-		for _, enumDescriptor := range msg.GetEnumType() {
-
-			// Each one has several values:
-			for _, enumValue := range enumDescriptor.Value {
-
-				// Figure out the entire name of this field:
-				fullFieldName := fmt.Sprintf(".%v.%v", *msg.Name, *enumDescriptor.Name)
-
-				// If we find ENUM values for this field then put them into the JSONSchema list of allowed ENUM values:
-				if strings.HasSuffix(desc.GetTypeName(), fullFieldName) {
-					jsonSchemaType.Enum = append(jsonSchemaType.Enum, enumValue.Name)
-					jsonSchemaType.Enum = append(jsonSchemaType.Enum, enumValue.Number)
-				}
+		if enumType, has := curPkg.lookupEnumType(desc.GetTypeName()); has {
+			for _, enumValue := range enumType.Value {
+				jsonSchemaType.Enum = append(jsonSchemaType.Enum, enumValue.Name)
+				jsonSchemaType.Enum = append(jsonSchemaType.Enum, enumValue.Number)
 			}
+		} else {
+			return nil, fmt.Errorf("no such enum type named %s", desc.GetTypeName())
 		}
 
 	case descriptor.FieldDescriptorProto_TYPE_BOOL:
@@ -498,16 +527,15 @@ func convert(req *plugin.CodeGeneratorRequest) (*plugin.CodeGeneratorResponse, e
 
 	res := &plugin.CodeGeneratorResponse{}
 	for _, file := range req.GetProtoFile() {
-		for _, msg := range file.GetMessageType() {
-			logWithLevel(LOG_DEBUG, "Loading a message type %s from package %s", msg.GetName(), file.GetPackage())
-			registerType(file.Package, msg)
-		}
+		registerFile(file)
 	}
+
 	for _, file := range req.GetProtoFile() {
 		if _, ok := generateTargets[file.GetName()]; ok {
 			logWithLevel(LOG_DEBUG, "Converting file (%v)", file.GetName())
 			converted, err := convertFile(file)
 			if err != nil {
+				panic(err)
 				res.Error = proto.String(fmt.Sprintf("Failed to convert %s: %v", file.GetName(), err))
 				return res, err
 			}
