@@ -411,13 +411,16 @@ func convertMessageType(curPkg *ProtoPackage, msg *descriptor.DescriptorProto) (
 
 	logWithLevel(LOG_DEBUG, "Converting message: %s", proto.MarshalTextString(msg))
 	for _, fieldDesc := range msg.GetField() {
-		recursedJSONSchemaType, err := convertField(curPkg, fieldDesc, msg)
-		if err != nil {
-			logWithLevel(LOG_ERROR, "Failed to convert field %s in %s: %v", fieldDesc.GetName(), msg.GetName(), err)
-			return jsonSchemaType, err
+		if fieldDesc.Options.GetDeprecated() {
+			logWithLevel(LOG_DEBUG, "Field %s in %s is deprecated", fieldDesc.GetName(), msg.GetName())
+		} else {
+			recursedJSONSchemaType, err := convertField(curPkg, fieldDesc, msg)
+			if err != nil {
+				logWithLevel(LOG_ERROR, "Failed to convert field %s in %s: %v", fieldDesc.GetName(), msg.GetName(), err)
+				return jsonSchemaType, err
+			}
+			jsonSchemaType.Properties[*fieldDesc.JsonName] = recursedJSONSchemaType
 		}
-		//jsonSchemaType.Properties[fieldDesc.GetName()] = recursedJSONSchemaType
-		jsonSchemaType.Properties[*fieldDesc.JsonName] = recursedJSONSchemaType
 	}
 	return jsonSchemaType, nil
 }
