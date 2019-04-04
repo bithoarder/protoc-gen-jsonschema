@@ -409,11 +409,34 @@ func convertMessageType(curPkg *ProtoPackage, msg *descriptor.DescriptorProto) (
 		}
 	}
 
+	oneOf := map[int32]*jsonschema.Type{}
+
 	logWithLevel(LOG_DEBUG, "Converting message: %s", proto.MarshalTextString(msg))
 	for _, fieldDesc := range msg.GetField() {
 		if fieldDesc.Options.GetDeprecated() {
 			logWithLevel(LOG_DEBUG, "Field %s in %s is deprecated", fieldDesc.GetName(), msg.GetName())
 		} else {
+			if jsonSchemaType.AnyOf == nil {
+				jsonSchemaType.AnyOf = []*jsonschema.Type{}
+				jsonSchemaType.AnyOf = append(jsonSchemaType.AnyOf, jsonSchemaType.OneOf...)
+				jsonSchemaType.OneOf = nil
+			}
+
+			if fieldDesc.OneofIndex != nil {
+				if oneOfType, has := oneOf[*fieldDesc.OneofIndex]; !has {
+					oneOfType = &jsonschema.Type{
+						//Properties: make(map[string]*jsonschema.Type),
+						OneOf: []*jsonschema.Type{},
+					}
+					jsonSchemaType.AnyOf = append(jsonSchemaType.AnyOf, oneOfType)
+					oneOf[*fieldDesc.OneofIndex] = oneOfType
+
+					oneOfType.OneOf = append(oneOfType.OneOf, &jsonschema.Type{Required: []string{*fieldDesc.JsonName}})
+				} else {
+					oneOfType.OneOf = append(oneOfType.OneOf, &jsonschema.Type{Required: []string{*fieldDesc.JsonName}})
+				}
+			}
+
 			recursedJSONSchemaType, err := convertField(curPkg, fieldDesc, msg)
 			if err != nil {
 				logWithLevel(LOG_ERROR, "Failed to convert field %s in %s: %v", fieldDesc.GetName(), msg.GetName(), err)
