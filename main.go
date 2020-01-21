@@ -342,34 +342,48 @@ func convertField(curPkg *ProtoPackage, desc *descriptor.FieldDescriptorProto, m
 
 	// Recurse nested objects / arrays of objects (if necessary):
 	if jsonSchemaType.Type == gojsonschema.TYPE_OBJECT {
+		//jsonSchemaType.Description = fmt.Sprintf("%s", desc.GetTypeName())
 
-		recordType, ok := curPkg.lookupType(desc.GetTypeName())
-		if !ok {
-			return nil, fmt.Errorf("no such message type named %s", desc.GetTypeName())
-		}
-
-		// Recurse:
-		recursedJSONSchemaType, err := convertMessageType(curPkg, recordType)
-		if err != nil {
-			return nil, err
-		}
-
-		// The result is stored differently for arrays of objects (they become "items"):
-		if desc.GetLabel() == descriptor.FieldDescriptorProto_LABEL_REPEATED {
-			jsonSchemaType.Items = &recursedJSONSchemaType
-			jsonSchemaType.Type = gojsonschema.TYPE_ARRAY
+		// todo: find way to configure known types, maybe via protobuf message extensions, for now this is just a quick hack:
+		if desc.GetTypeName() == ".google.protobuf.Timestamp" {
+			jsonSchemaType.Type = gojsonschema.TYPE_STRING
+			jsonSchemaType.AdditionalProperties = nil
+			// this is the only allowed format, see https://github.com/protocolbuffers/protobuf/blob/master/src/google/protobuf/timestamp.proto
+			jsonSchemaType.Pattern = `^20[0-9]{2}-([0]?[1-9]|[1][0-2])-([0]?[1-9]|[12][0-9]|3[01])T([0]?[0-9]|1[0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\.[0-9]+)?Z$`
+		} else if desc.GetTypeName() == ".google.protobuf.Duration" {
+			jsonSchemaType.Type = gojsonschema.TYPE_STRING
+			jsonSchemaType.AdditionalProperties = nil
+			// simplifed version of Duration parsing:
+			jsonSchemaType.Pattern = `^[-+]?(([0-9]+h)([0-5]?[0-9]m)?([0-5]?[0-9]s)?([0-9]?[0-9]?[0-9]ms)?|([0-9]+m)([0-5]?[0-9]s)?([0-9]?[0-9]?[0-9]ms)?|([0-9]+s)([0-9]?[0-9]?[0-9]ms)?|([0-9]+ms))$`
 		} else {
-			// Nested objects are more straight-forward:
-			jsonSchemaType.Properties = recursedJSONSchemaType.Properties
-		}
-
-		// Optionally allow NULL values:
-		if allowNullValues {
-			jsonSchemaType.OneOf = []*jsonschema.Type{
-				{Type: gojsonschema.TYPE_NULL},
-				{Type: jsonSchemaType.Type},
+			recordType, ok := curPkg.lookupType(desc.GetTypeName())
+			if !ok {
+				return nil, fmt.Errorf("no such message type named %s", desc.GetTypeName())
 			}
-			jsonSchemaType.Type = ""
+
+			// Recurse:
+			recursedJSONSchemaType, err := convertMessageType(curPkg, recordType)
+			if err != nil {
+				return nil, err
+			}
+
+			// The result is stored differently for arrays of objects (they become "items"):
+			if desc.GetLabel() == descriptor.FieldDescriptorProto_LABEL_REPEATED {
+				jsonSchemaType.Items = &recursedJSONSchemaType
+				jsonSchemaType.Type = gojsonschema.TYPE_ARRAY
+			} else {
+				// Nested objects are more straight-forward:
+				jsonSchemaType.Properties = recursedJSONSchemaType.Properties
+			}
+
+			// Optionally allow NULL values:
+			if allowNullValues {
+				jsonSchemaType.OneOf = []*jsonschema.Type{
+					{Type: gojsonschema.TYPE_NULL},
+					{Type: jsonSchemaType.Type},
+				}
+				jsonSchemaType.Type = ""
+			}
 		}
 	}
 
