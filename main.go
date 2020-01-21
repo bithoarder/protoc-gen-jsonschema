@@ -214,6 +214,26 @@ func (pkg *ProtoPackage) relativelyLookupPackage(name string) (*ProtoPackage, bo
 	return pkg, true
 }
 
+func setMinimum(jsonSchemaType *jsonschema.Type, min int) {
+	if min != 0 {
+		jsonSchemaType.Minimum = int(min)
+	} else {
+		// a hack to get around omitempty on Minimum
+		jsonSchemaType.Minimum = -1
+		jsonSchemaType.ExclusiveMinimum = true
+	}
+}
+
+func setMaximum(jsonSchemaType *jsonschema.Type, max int) {
+	if max != 0 {
+		jsonSchemaType.Maximum = int(max)
+	} else {
+		// a hack to get around omitempty on Maximum
+		jsonSchemaType.Maximum = 1
+		jsonSchemaType.ExclusiveMaximum = true
+	}
+}
+
 // Convert a proto "field" (essentially a type-switch with some recursion):
 func convertField(curPkg *ProtoPackage, desc *descriptor.FieldDescriptorProto, msg *descriptor.DescriptorProto) (*jsonschema.Type, error) {
 
@@ -314,8 +334,37 @@ func convertField(curPkg *ProtoPackage, desc *descriptor.FieldDescriptorProto, m
 		return nil, fmt.Errorf("unrecognized field type: %s", desc.GetType().String())
 	}
 
+	isRepeated := desc.GetLabel() == descriptor.FieldDescriptorProto_LABEL_REPEATED
+
+	if desc.Options != nil {
+		if ext, err := proto.GetExtension(desc.Options, E_JsonSchema); err == proto.ErrMissingExtension {
+		} else if err != nil {
+			return nil, err
+		} else if jsonSchema, ok := ext.(*Schema); ok {
+			jsonSchemaType.Description = jsonSchema.Description
+			switch r := jsonSchema.Rule.(type) {
+			case nil:
+				// only had an description
+			case *Schema_Ref:
+				// replace whole schema with just a ref
+				return &jsonschema.Type{Ref: r.Ref}, nil
+			case *Schema_Pattern:
+				jsonSchemaType.Pattern = r.Pattern
+			case *Schema_Min:
+				setMinimum(jsonSchemaType, int(r.Min))
+			case *Schema_Max:
+				setMaximum(jsonSchemaType, int(r.Max))
+			case *Schema_Range_:
+				setMinimum(jsonSchemaType, int(r.Range.Min))
+				setMaximum(jsonSchemaType, int(r.Range.Max))
+			default:
+				return nil, fmt.Errorf("unsupported json schema extension %T", r)
+			}
+		}
+	}
+
 	// Recurse array of primitive types:
-	if desc.GetLabel() == descriptor.FieldDescriptorProto_LABEL_REPEATED && jsonSchemaType.Type != gojsonschema.TYPE_OBJECT {
+	if isRepeated && jsonSchemaType.Type != gojsonschema.TYPE_OBJECT {
 		jsonSchemaType.Items = &jsonschema.Type{}
 
 		if len(jsonSchemaType.Enum) > 0 {
@@ -326,6 +375,12 @@ func convertField(curPkg *ProtoPackage, desc *descriptor.FieldDescriptorProto, m
 			jsonSchemaType.Items.Type = jsonSchemaType.Type
 			jsonSchemaType.Items.OneOf = jsonSchemaType.OneOf
 		}
+
+		jsonSchemaType.Items.Pattern, jsonSchemaType.Pattern = jsonSchemaType.Pattern, jsonSchemaType.Items.Pattern
+		jsonSchemaType.Items.Minimum, jsonSchemaType.Minimum = jsonSchemaType.Minimum, jsonSchemaType.Items.Minimum
+		jsonSchemaType.Items.Maximum, jsonSchemaType.Maximum = jsonSchemaType.Maximum, jsonSchemaType.Items.Maximum
+		jsonSchemaType.Items.ExclusiveMinimum, jsonSchemaType.ExclusiveMinimum = jsonSchemaType.ExclusiveMinimum, jsonSchemaType.Items.ExclusiveMinimum
+		jsonSchemaType.Items.ExclusiveMaximum, jsonSchemaType.ExclusiveMaximum = jsonSchemaType.ExclusiveMaximum, jsonSchemaType.Items.ExclusiveMaximum
 
 		if allowNullValues {
 			jsonSchemaType.OneOf = []*jsonschema.Type{
@@ -353,7 +408,7 @@ func convertField(curPkg *ProtoPackage, desc *descriptor.FieldDescriptorProto, m
 		} else if desc.GetTypeName() == ".google.protobuf.Duration" {
 			jsonSchemaType.Type = gojsonschema.TYPE_STRING
 			jsonSchemaType.AdditionalProperties = nil
-			// simplifed version of Duration parsing:
+			// simplified version of Duration parsing:
 			jsonSchemaType.Pattern = `^[-+]?(([0-9]+h)([0-5]?[0-9]m)?([0-5]?[0-9]s)?([0-9]?[0-9]?[0-9]ms)?|([0-9]+m)([0-5]?[0-9]s)?([0-9]?[0-9]?[0-9]ms)?|([0-9]+s)([0-9]?[0-9]?[0-9]ms)?|([0-9]+ms))$`
 		} else {
 			recordType, ok := curPkg.lookupType(desc.GetTypeName())

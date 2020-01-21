@@ -1,5 +1,8 @@
 default: darwin linux windows
 
+build_proto:
+	@protoc --go_out=. schema.proto
+
 build:
 	@echo "Generating binary (protoc-gen-jsonschema) ..."
 	@go build -o protoc-gen-jsonschema
