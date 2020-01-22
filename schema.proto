@@ -16,6 +16,12 @@ message Schema {
 
     string description = 10;
 
+    uint64 min_length = 11;
+    uint64 max_length = 12;
+
+    uint64 min_items = 13;
+    uint64 max_items = 14;
+
     oneof rule {
         string ref = 1;
         string pattern = 2;

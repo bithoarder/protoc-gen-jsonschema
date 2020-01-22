@@ -342,6 +342,11 @@ func convertField(curPkg *ProtoPackage, desc *descriptor.FieldDescriptorProto, m
 			return nil, err
 		} else if jsonSchema, ok := ext.(*Schema); ok {
 			jsonSchemaType.Description = jsonSchema.Description
+			jsonSchemaType.MinLength = int(jsonSchema.MinLength)
+			jsonSchemaType.MaxLength = int(jsonSchema.MaxLength)
+			jsonSchemaType.MinItems = int(jsonSchema.MinItems)
+			jsonSchemaType.MaxItems = int(jsonSchema.MaxItems)
+
 			switch r := jsonSchema.Rule.(type) {
 			case nil:
 				// only had an description
