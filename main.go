@@ -235,12 +235,14 @@ func setMaximum(jsonSchemaType *jsonschema.Type, max int) {
 }
 
 // Convert a proto "field" (essentially a type-switch with some recursion):
-func convertField(curPkg *ProtoPackage, desc *descriptor.FieldDescriptorProto, msg *descriptor.DescriptorProto) (*jsonschema.Type, error) {
+func convertField(curPkg *ProtoPackage, desc *descriptor.FieldDescriptorProto, msg *descriptor.DescriptorProto) (*jsonschema.Type, bool, error) {
 
 	// Prepare a new jsonschema.Type for our eventual return value:
 	jsonSchemaType := &jsonschema.Type{
 		Properties: make(map[string]*jsonschema.Type),
 	}
+
+	required := false
 
 	// Switch the types, and pick a JSONSchema equivalent:
 	switch desc.GetType() {
@@ -306,7 +308,7 @@ func convertField(curPkg *ProtoPackage, desc *descriptor.FieldDescriptorProto, m
 				jsonSchemaType.Enum = append(jsonSchemaType.Enum, enumValue.Number)
 			}
 		} else {
-			return nil, fmt.Errorf("no such enum type named %s", desc.GetTypeName())
+			return nil, false, fmt.Errorf("no such enum type named %s", desc.GetTypeName())
 		}
 
 	case descriptor.FieldDescriptorProto_TYPE_BOOL:
@@ -331,7 +333,7 @@ func convertField(curPkg *ProtoPackage, desc *descriptor.FieldDescriptorProto, m
 		jsonSchemaType.AdditionalProperties = []byte("false")
 
 	default:
-		return nil, fmt.Errorf("unrecognized field type: %s", desc.GetType().String())
+		return nil, false, fmt.Errorf("unrecognized field type: %s", desc.GetType().String())
 	}
 
 	isRepeated := desc.GetLabel() == descriptor.FieldDescriptorProto_LABEL_REPEATED
@@ -339,20 +341,23 @@ func convertField(curPkg *ProtoPackage, desc *descriptor.FieldDescriptorProto, m
 	if desc.Options != nil {
 		if ext, err := proto.GetExtension(desc.Options, E_JsonSchema); err == proto.ErrMissingExtension {
 		} else if err != nil {
-			return nil, err
+			return nil, false, err
 		} else if jsonSchema, ok := ext.(*Schema); ok {
 			jsonSchemaType.Description = jsonSchema.Description
 			jsonSchemaType.MinLength = int(jsonSchema.MinLength)
 			jsonSchemaType.MaxLength = int(jsonSchema.MaxLength)
 			jsonSchemaType.MinItems = int(jsonSchema.MinItems)
 			jsonSchemaType.MaxItems = int(jsonSchema.MaxItems)
+			jsonSchemaType.UniqueItems = jsonSchema.UniqueItems
+
+			required = jsonSchema.Required
 
 			switch r := jsonSchema.Rule.(type) {
 			case nil:
 				// only had an description
 			case *Schema_Ref:
 				// replace whole schema with just a ref
-				return &jsonschema.Type{Ref: r.Ref}, nil
+				return &jsonschema.Type{Ref: r.Ref}, required, nil
 			case *Schema_Pattern:
 				jsonSchemaType.Pattern = r.Pattern
 			case *Schema_Min:
@@ -363,7 +368,7 @@ func convertField(curPkg *ProtoPackage, desc *descriptor.FieldDescriptorProto, m
 				setMinimum(jsonSchemaType, int(r.Range.Min))
 				setMaximum(jsonSchemaType, int(r.Range.Max))
 			default:
-				return nil, fmt.Errorf("unsupported json schema extension %T", r)
+				return nil, false, fmt.Errorf("unsupported json schema extension %T", r)
 			}
 		}
 	}
@@ -397,7 +402,7 @@ func convertField(curPkg *ProtoPackage, desc *descriptor.FieldDescriptorProto, m
 			jsonSchemaType.OneOf = []*jsonschema.Type{}
 		}
 
-		return jsonSchemaType, nil
+		return jsonSchemaType, required, nil
 	}
 
 	// Recurse nested objects / arrays of objects (if necessary):
@@ -418,13 +423,13 @@ func convertField(curPkg *ProtoPackage, desc *descriptor.FieldDescriptorProto, m
 		} else {
 			recordType, ok := curPkg.lookupType(desc.GetTypeName())
 			if !ok {
-				return nil, fmt.Errorf("no such message type named %s", desc.GetTypeName())
+				return nil, false, fmt.Errorf("no such message type named %s", desc.GetTypeName())
 			}
 
 			// Recurse:
 			recursedJSONSchemaType, err := convertMessageType(curPkg, recordType)
 			if err != nil {
-				return nil, err
+				return nil, false, err
 			}
 
 			// The result is stored differently for arrays of objects (they become "items"):
@@ -434,6 +439,7 @@ func convertField(curPkg *ProtoPackage, desc *descriptor.FieldDescriptorProto, m
 			} else {
 				// Nested objects are more straight-forward:
 				jsonSchemaType.Properties = recursedJSONSchemaType.Properties
+				jsonSchemaType.Required = recursedJSONSchemaType.Required
 			}
 
 			// Optionally allow NULL values:
@@ -447,7 +453,7 @@ func convertField(curPkg *ProtoPackage, desc *descriptor.FieldDescriptorProto, m
 		}
 	}
 
-	return jsonSchemaType, nil
+	return jsonSchemaType, required, nil
 }
 
 // Converts a proto "MESSAGE" into a JSON-Schema:
@@ -511,12 +517,15 @@ func convertMessageType(curPkg *ProtoPackage, msg *descriptor.DescriptorProto) (
 				}
 			}
 
-			recursedJSONSchemaType, err := convertField(curPkg, fieldDesc, msg)
+			recursedJSONSchemaType, required, err := convertField(curPkg, fieldDesc, msg)
 			if err != nil {
 				logWithLevel(LOG_ERROR, "Failed to convert field %s in %s: %v", fieldDesc.GetName(), msg.GetName(), err)
 				return jsonSchemaType, err
 			}
 			jsonSchemaType.Properties[*fieldDesc.JsonName] = recursedJSONSchemaType
+			if required {
+				jsonSchemaType.Required = append(jsonSchemaType.Required, *fieldDesc.JsonName)
+			}
 		}
 	}
 	return jsonSchemaType, nil
