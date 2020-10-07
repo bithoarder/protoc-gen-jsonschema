@@ -39,6 +39,7 @@ var (
 	disallowBigIntsAsStrings     bool = false
 	debugLogging                 bool = false
 	addSchemaProperty            bool = false
+	emitEnumIntegerOptions       bool = false
 	globalPkg                         = &ProtoPackage{
 		name:     "",
 		parent:   nil,
@@ -71,7 +72,8 @@ func init() {
 	flag.BoolVar(&disallowAdditionalProperties, "disallow_additional_properties", false, "Disallow additional properties")
 	flag.BoolVar(&disallowBigIntsAsStrings, "disallow_bigints_as_strings", false, "Disallow bigints to be strings (eg scientific notation)")
 	flag.BoolVar(&debugLogging, "debug", false, "Log debug messages")
-	flag.BoolVar(&addSchemaProperty, "add_schema_property", false, "Add $schema property to all messages")
+	flag.BoolVar(&addSchemaProperty, "add_schema_property", false, "Add $schema property to top message")
+	flag.BoolVar(&emitEnumIntegerOptions, "emit_enum_ints", false, "Also include enum integer values")
 }
 
 func logWithLevel(logLevel LogLevel, logFormat string, logParams ...interface{}) {
@@ -235,7 +237,7 @@ func setMaximum(jsonSchemaType *jsonschema.Type, max int) {
 }
 
 // Convert a proto "field" (essentially a type-switch with some recursion):
-func convertField(curPkg *ProtoPackage, desc *descriptor.FieldDescriptorProto, msg *descriptor.DescriptorProto) (*jsonschema.Type, bool, error) {
+func convertField(curPkg *ProtoPackage, desc *descriptor.FieldDescriptorProto, msg *descriptor.DescriptorProto, definitions map[string]*jsonschema.Type) (*jsonschema.Type, bool, error) {
 
 	// Prepare a new jsonschema.Type for our eventual return value:
 	jsonSchemaType := &jsonschema.Type{
@@ -296,20 +298,34 @@ func convertField(curPkg *ProtoPackage, desc *descriptor.FieldDescriptorProto, m
 		}
 
 	case descriptor.FieldDescriptorProto_TYPE_ENUM:
-		jsonSchemaType.OneOf = append(jsonSchemaType.OneOf, &jsonschema.Type{Type: gojsonschema.TYPE_STRING})
-		jsonSchemaType.OneOf = append(jsonSchemaType.OneOf, &jsonschema.Type{Type: gojsonschema.TYPE_INTEGER})
-		if allowNullValues {
-			jsonSchemaType.OneOf = append(jsonSchemaType.OneOf, &jsonschema.Type{Type: gojsonschema.TYPE_NULL})
-		}
-
-		if enumType, has := curPkg.lookupEnumType(desc.GetTypeName()); has {
-			for _, enumValue := range enumType.Value {
-				jsonSchemaType.Enum = append(jsonSchemaType.Enum, enumValue.Name)
-				jsonSchemaType.Enum = append(jsonSchemaType.Enum, enumValue.Number)
+		if _, has := definitions[desc.GetTypeName()]; !has {
+			enumSchemaType := jsonschema.Type{
+				Properties: make(map[string]*jsonschema.Type),
 			}
-		} else {
-			return nil, false, fmt.Errorf("no such enum type named %s", desc.GetTypeName())
+			if emitEnumIntegerOptions || allowNullValues {
+				enumSchemaType.OneOf = append(enumSchemaType.OneOf, &jsonschema.Type{Type: gojsonschema.TYPE_STRING})
+				enumSchemaType.OneOf = append(enumSchemaType.OneOf, &jsonschema.Type{Type: gojsonschema.TYPE_INTEGER})
+				if allowNullValues {
+					enumSchemaType.OneOf = append(enumSchemaType.OneOf, &jsonschema.Type{Type: gojsonschema.TYPE_NULL})
+				}
+			} else {
+				enumSchemaType.Type = gojsonschema.TYPE_STRING
+			}
+
+			if enumType, has := curPkg.lookupEnumType(desc.GetTypeName()); has {
+				for _, enumValue := range enumType.Value {
+					enumSchemaType.Enum = append(enumSchemaType.Enum, enumValue.Name)
+					if emitEnumIntegerOptions {
+						enumSchemaType.Enum = append(enumSchemaType.Enum, enumValue.Number)
+					}
+				}
+			} else {
+				return nil, false, fmt.Errorf("no such enum type named %s", desc.GetTypeName())
+			}
+
+			definitions[desc.GetTypeName()] = &enumSchemaType
 		}
+		jsonSchemaType.Ref = fmt.Sprintf("#/definitions/%s", desc.GetTypeName())
 
 	case descriptor.FieldDescriptorProto_TYPE_BOOL:
 		if allowNullValues {
@@ -380,9 +396,13 @@ func convertField(curPkg *ProtoPackage, desc *descriptor.FieldDescriptorProto, m
 		if len(jsonSchemaType.Enum) > 0 {
 			jsonSchemaType.Items.Enum = jsonSchemaType.Enum
 			jsonSchemaType.Enum = nil
+			jsonSchemaType.Items.Ref = jsonSchemaType.Ref
+			jsonSchemaType.Ref = ""
 			jsonSchemaType.Items.OneOf = nil
 		} else {
 			jsonSchemaType.Items.Type = jsonSchemaType.Type
+			jsonSchemaType.Items.Ref = jsonSchemaType.Ref
+			jsonSchemaType.Ref = ""
 			jsonSchemaType.Items.OneOf = jsonSchemaType.OneOf
 		}
 
@@ -427,17 +447,18 @@ func convertField(curPkg *ProtoPackage, desc *descriptor.FieldDescriptorProto, m
 			}
 
 			// Recurse:
-			recursedJSONSchemaType, err := convertMessageType(curPkg, recordType)
+			recursedJSONSchemaType, err := convertMessageType(curPkg, desc.GetTypeName(), recordType, definitions)
 			if err != nil {
 				return nil, false, err
 			}
 
 			// The result is stored differently for arrays of objects (they become "items"):
 			if desc.GetLabel() == descriptor.FieldDescriptorProto_LABEL_REPEATED {
-				jsonSchemaType.Items = &recursedJSONSchemaType
+				jsonSchemaType.Items = recursedJSONSchemaType
 				jsonSchemaType.Type = gojsonschema.TYPE_ARRAY
 			} else {
 				// Nested objects are more straight-forward:
+				jsonSchemaType.Ref = recursedJSONSchemaType.Ref
 				jsonSchemaType.Properties = recursedJSONSchemaType.Properties
 				jsonSchemaType.Required = recursedJSONSchemaType.Required
 			}
@@ -457,96 +478,100 @@ func convertField(curPkg *ProtoPackage, desc *descriptor.FieldDescriptorProto, m
 }
 
 // Converts a proto "MESSAGE" into a JSON-Schema:
-func convertMessageType(curPkg *ProtoPackage, msg *descriptor.DescriptorProto) (jsonschema.Type, error) {
-
+func convertMessageType(curPkg *ProtoPackage, typeName string, msg *descriptor.DescriptorProto, definitions map[string]*jsonschema.Type) (*jsonschema.Type, error) {
 	// Prepare a new jsonschema:
-	jsonSchemaType := jsonschema.Type{
-		Properties: make(map[string]*jsonschema.Type),
-		Version:    jsonschema.Version,
-	}
+	if _, has := definitions[typeName]; !has {
+		definitions[typeName] = nil // "pre register" a empty type to allow recursive types to work.
 
-	// Optionally allow NULL values:
-	if allowNullValues {
-		jsonSchemaType.OneOf = []*jsonschema.Type{
-			{Type: gojsonschema.TYPE_NULL},
-			{Type: gojsonschema.TYPE_OBJECT},
+		jsonSchemaType := jsonschema.Type{
+			Properties: make(map[string]*jsonschema.Type),
 		}
-	} else {
-		jsonSchemaType.Type = gojsonschema.TYPE_OBJECT
-	}
 
-	// disallowAdditionalProperties will prevent validation where extra fields are found (outside of the schema):
-	if disallowAdditionalProperties {
-		jsonSchemaType.AdditionalProperties = []byte("false")
-	} else {
-		jsonSchemaType.AdditionalProperties = []byte("true")
-	}
-
-	if addSchemaProperty {
-		jsonSchemaType.Properties["$schema"] = &jsonschema.Type{
-			Type:   "string",
-			Format: "uri",
-		}
-	}
-
-	oneOf := map[int32]*jsonschema.Type{}
-
-	logWithLevel(LOG_DEBUG, "Converting message: %s", proto.MarshalTextString(msg))
-	for _, fieldDesc := range msg.GetField() {
-		if fieldDesc.Options.GetDeprecated() {
-			logWithLevel(LOG_DEBUG, "Field %s in %s is deprecated", fieldDesc.GetName(), msg.GetName())
-		} else {
-			if jsonSchemaType.AnyOf == nil {
-				jsonSchemaType.AnyOf = []*jsonschema.Type{}
-				jsonSchemaType.AnyOf = append(jsonSchemaType.AnyOf, jsonSchemaType.OneOf...)
-				jsonSchemaType.OneOf = nil
+		// Optionally allow NULL values:
+		if allowNullValues {
+			jsonSchemaType.OneOf = []*jsonschema.Type{
+				{Type: gojsonschema.TYPE_NULL},
+				{Type: gojsonschema.TYPE_OBJECT},
 			}
+		} else {
+			jsonSchemaType.Type = gojsonschema.TYPE_OBJECT
+		}
 
-			if fieldDesc.OneofIndex != nil {
-				if oneOfType, has := oneOf[*fieldDesc.OneofIndex]; !has {
-					oneOfType = &jsonschema.Type{
-						//Properties: make(map[string]*jsonschema.Type),
-						OneOf: []*jsonschema.Type{},
+		// disallowAdditionalProperties will prevent validation where extra fields are found (outside of the schema):
+		if disallowAdditionalProperties {
+			jsonSchemaType.AdditionalProperties = []byte("false")
+		} else {
+			jsonSchemaType.AdditionalProperties = []byte("true")
+		}
+
+		oneOf := map[int32]*jsonschema.Type{}
+
+		logWithLevel(LOG_DEBUG, "Converting message: %s", proto.MarshalTextString(msg))
+		for _, fieldDesc := range msg.GetField() {
+			if fieldDesc.Options.GetDeprecated() {
+				logWithLevel(LOG_DEBUG, "Field %s in %s is deprecated", fieldDesc.GetName(), msg.GetName())
+			} else {
+				if jsonSchemaType.AnyOf == nil {
+					jsonSchemaType.AnyOf = []*jsonschema.Type{}
+					jsonSchemaType.AnyOf = append(jsonSchemaType.AnyOf, jsonSchemaType.OneOf...)
+					jsonSchemaType.OneOf = nil
+				}
+
+				if fieldDesc.OneofIndex != nil {
+					if oneOfType, has := oneOf[*fieldDesc.OneofIndex]; !has {
+						oneOfType = &jsonschema.Type{
+							//Properties: make(map[string]*jsonschema.Type),
+							OneOf: []*jsonschema.Type{},
+						}
+						jsonSchemaType.AnyOf = append(jsonSchemaType.AnyOf, oneOfType)
+						oneOf[*fieldDesc.OneofIndex] = oneOfType
+
+						oneOfType.OneOf = append(oneOfType.OneOf, &jsonschema.Type{Required: []string{*fieldDesc.JsonName}})
+					} else {
+						oneOfType.OneOf = append(oneOfType.OneOf, &jsonschema.Type{Required: []string{*fieldDesc.JsonName}})
 					}
-					jsonSchemaType.AnyOf = append(jsonSchemaType.AnyOf, oneOfType)
-					oneOf[*fieldDesc.OneofIndex] = oneOfType
+				}
 
-					oneOfType.OneOf = append(oneOfType.OneOf, &jsonschema.Type{Required: []string{*fieldDesc.JsonName}})
-				} else {
-					oneOfType.OneOf = append(oneOfType.OneOf, &jsonschema.Type{Required: []string{*fieldDesc.JsonName}})
+				recursedJSONSchemaType, required, err := convertField(curPkg, fieldDesc, msg, definitions)
+				if err != nil {
+					logWithLevel(LOG_ERROR, "Failed to convert field %s in %s: %v", fieldDesc.GetName(), msg.GetName(), err)
+					return &jsonSchemaType, err
+				}
+				jsonSchemaType.Properties[*fieldDesc.JsonName] = recursedJSONSchemaType
+				if required {
+					jsonSchemaType.Required = append(jsonSchemaType.Required, *fieldDesc.JsonName)
 				}
 			}
-
-			recursedJSONSchemaType, required, err := convertField(curPkg, fieldDesc, msg)
-			if err != nil {
-				logWithLevel(LOG_ERROR, "Failed to convert field %s in %s: %v", fieldDesc.GetName(), msg.GetName(), err)
-				return jsonSchemaType, err
-			}
-			jsonSchemaType.Properties[*fieldDesc.JsonName] = recursedJSONSchemaType
-			if required {
-				jsonSchemaType.Required = append(jsonSchemaType.Required, *fieldDesc.JsonName)
-			}
 		}
+
+		definitions[typeName] = &jsonSchemaType
 	}
-	return jsonSchemaType, nil
+
+	return &jsonschema.Type{
+		Ref: fmt.Sprintf("#/definitions/%s", typeName),
+	}, nil
 }
 
 // Converts a proto "ENUM" into a JSON-Schema:
 func convertEnumType(enum *descriptor.EnumDescriptorProto) (jsonschema.Type, error) {
 
 	// Prepare a new jsonschema.Type for our eventual return value:
-	jsonSchemaType := jsonschema.Type{
-		Version: jsonschema.Version,
-	}
+	jsonSchemaType := jsonschema.Type{}
 
 	// Allow both strings and integers:
-	jsonSchemaType.OneOf = append(jsonSchemaType.OneOf, &jsonschema.Type{Type: "string"})
-	jsonSchemaType.OneOf = append(jsonSchemaType.OneOf, &jsonschema.Type{Type: "integer"})
+	if emitEnumIntegerOptions {
+		jsonSchemaType.OneOf = append(jsonSchemaType.OneOf, &jsonschema.Type{Type: "string"})
+		jsonSchemaType.OneOf = append(jsonSchemaType.OneOf, &jsonschema.Type{Type: "integer"})
+	} else {
+		jsonSchemaType.Type = "string"
+	}
 
 	// Add the allowed values:
 	for _, enumValue := range enum.Value {
 		jsonSchemaType.Enum = append(jsonSchemaType.Enum, enumValue.Name)
-		jsonSchemaType.Enum = append(jsonSchemaType.Enum, enumValue.Number)
+		if emitEnumIntegerOptions {
+			jsonSchemaType.Enum = append(jsonSchemaType.Enum, enumValue.Number)
+		}
 	}
 
 	return jsonSchemaType, nil
@@ -603,11 +628,28 @@ func convertFile(file *descriptor.FileDescriptorProto) ([]*plugin.CodeGeneratorR
 		for _, msg := range file.GetMessageType() {
 			jsonSchemaFileName := fmt.Sprintf("%s.schema.json", msg.GetName())
 			logWithLevel(LOG_INFO, "Generating JSON-schema for MESSAGE (%v) in file [%v] => %v", msg.GetName(), protoFileName, jsonSchemaFileName)
-			messageJSONSchema, err := convertMessageType(pkg, msg)
+
+			schemaDefinitions := map[string]*jsonschema.Type{}
+
+			messageJSONSchema, err := convertMessageType(pkg, "root", msg, schemaDefinitions)
 			if err != nil {
 				logWithLevel(LOG_ERROR, "Failed to convert %s: %v", protoFileName, err)
 				return nil, err
 			} else {
+				messageJSONSchema.Definitions = schemaDefinitions
+
+				messageJSONSchema.Version = jsonschema.Version
+
+				if addSchemaProperty {
+					if messageJSONSchema.Properties == nil {
+						messageJSONSchema.Properties = make(map[string]*jsonschema.Type)
+					}
+					messageJSONSchema.Properties["$schema"] = &jsonschema.Type{
+						Type:   "string",
+						Format: "uri",
+					}
+				}
+
 				// Marshal the JSON-Schema into JSON:
 				jsonSchemaJSON, err := json.MarshalIndent(messageJSONSchema, "", "    ")
 				if err != nil {
