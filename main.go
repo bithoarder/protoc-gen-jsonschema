@@ -15,6 +15,7 @@ import (
 	"github.com/golang/protobuf/proto"
 	"github.com/golang/protobuf/protoc-gen-go/descriptor"
 	plugin "github.com/golang/protobuf/protoc-gen-go/plugin"
+	"github.com/iancoleman/orderedmap"
 	"github.com/xeipuuv/gojsonschema"
 	"io"
 	"io/ioutil"
@@ -85,6 +86,10 @@ func logWithLevel(logLevel LogLevel, logFormat string, logParams ...interface{})
 	// Otherwise log:
 	logMessage := fmt.Sprintf(logFormat, logParams...)
 	log.Printf(fmt.Sprintf("[%v] %v", logLevels[logLevel], logMessage))
+}
+
+func cleanTypeName(name string) string {
+	return strings.ReplaceAll(strings.TrimPrefix(name, ".proto."), ".", "_")
 }
 
 func (pkg *ProtoPackage) getChildPkg(pkgName string) *ProtoPackage {
@@ -240,9 +245,7 @@ func setMaximum(jsonSchemaType *jsonschema.Type, max int) {
 func convertField(curPkg *ProtoPackage, desc *descriptor.FieldDescriptorProto, msg *descriptor.DescriptorProto, definitions map[string]*jsonschema.Type) (*jsonschema.Type, bool, error) {
 
 	// Prepare a new jsonschema.Type for our eventual return value:
-	jsonSchemaType := &jsonschema.Type{
-		Properties: make(map[string]*jsonschema.Type),
-	}
+	jsonSchemaType := &jsonschema.Type{}
 
 	required := false
 
@@ -298,9 +301,10 @@ func convertField(curPkg *ProtoPackage, desc *descriptor.FieldDescriptorProto, m
 		}
 
 	case descriptor.FieldDescriptorProto_TYPE_ENUM:
-		if _, has := definitions[desc.GetTypeName()]; !has {
+		cleanTypeName := cleanTypeName(desc.GetTypeName())
+		if _, has := definitions[cleanTypeName]; !has {
 			enumSchemaType := jsonschema.Type{
-				Properties: make(map[string]*jsonschema.Type),
+				Properties: orderedmap.New(),
 			}
 			if emitEnumIntegerOptions || allowNullValues {
 				enumSchemaType.OneOf = append(enumSchemaType.OneOf, &jsonschema.Type{Type: gojsonschema.TYPE_STRING})
@@ -323,9 +327,9 @@ func convertField(curPkg *ProtoPackage, desc *descriptor.FieldDescriptorProto, m
 				return nil, false, fmt.Errorf("no such enum type named %s", desc.GetTypeName())
 			}
 
-			definitions[desc.GetTypeName()] = &enumSchemaType
+			definitions[cleanTypeName] = &enumSchemaType
 		}
-		jsonSchemaType.Ref = fmt.Sprintf("#/definitions/%s", desc.GetTypeName())
+		jsonSchemaType.Ref = fmt.Sprintf("#/definitions/%s", cleanTypeName)
 
 	case descriptor.FieldDescriptorProto_TYPE_BOOL:
 		if allowNullValues {
@@ -372,8 +376,9 @@ func convertField(curPkg *ProtoPackage, desc *descriptor.FieldDescriptorProto, m
 			case nil:
 				// only had an description
 			case *Schema_Ref:
-				// replace whole schema with just a ref
-				return &jsonschema.Type{Ref: r.Ref}, required, nil
+				// replace most schema with a ref
+				jsonSchemaType.Ref = r.Ref
+				jsonSchemaType.Type = ""
 			case *Schema_Pattern:
 				jsonSchemaType.Pattern = r.Pattern
 			case *Schema_Min:
@@ -456,9 +461,11 @@ func convertField(curPkg *ProtoPackage, desc *descriptor.FieldDescriptorProto, m
 			if desc.GetLabel() == descriptor.FieldDescriptorProto_LABEL_REPEATED {
 				jsonSchemaType.Items = recursedJSONSchemaType
 				jsonSchemaType.Type = gojsonschema.TYPE_ARRAY
+				jsonSchemaType.AdditionalProperties = nil
+			} else if recursedJSONSchemaType.Ref != "" {
+				jsonSchemaType = &jsonschema.Type{Ref: recursedJSONSchemaType.Ref}
 			} else {
 				// Nested objects are more straight-forward:
-				jsonSchemaType.Ref = recursedJSONSchemaType.Ref
 				jsonSchemaType.Properties = recursedJSONSchemaType.Properties
 				jsonSchemaType.Required = recursedJSONSchemaType.Required
 			}
@@ -480,11 +487,11 @@ func convertField(curPkg *ProtoPackage, desc *descriptor.FieldDescriptorProto, m
 // Converts a proto "MESSAGE" into a JSON-Schema:
 func convertMessageType(curPkg *ProtoPackage, typeName string, msg *descriptor.DescriptorProto, definitions map[string]*jsonschema.Type) (*jsonschema.Type, error) {
 	// Prepare a new jsonschema:
-	if _, has := definitions[typeName]; !has {
-		definitions[typeName] = nil // "pre register" a empty type to allow recursive types to work.
+	if _, has := definitions[cleanTypeName(typeName)]; !has {
+		definitions[cleanTypeName(typeName)] = nil // "pre register" a empty type to allow recursive types to work.
 
 		jsonSchemaType := jsonschema.Type{
-			Properties: make(map[string]*jsonschema.Type),
+			Properties: orderedmap.New(),
 		}
 
 		// Optionally allow NULL values:
@@ -537,18 +544,18 @@ func convertMessageType(curPkg *ProtoPackage, typeName string, msg *descriptor.D
 					logWithLevel(LOG_ERROR, "Failed to convert field %s in %s: %v", fieldDesc.GetName(), msg.GetName(), err)
 					return &jsonSchemaType, err
 				}
-				jsonSchemaType.Properties[*fieldDesc.JsonName] = recursedJSONSchemaType
+				jsonSchemaType.Properties.Set(*fieldDesc.JsonName, recursedJSONSchemaType)
 				if required {
 					jsonSchemaType.Required = append(jsonSchemaType.Required, *fieldDesc.JsonName)
 				}
 			}
 		}
 
-		definitions[typeName] = &jsonSchemaType
+		definitions[cleanTypeName(typeName)] = &jsonSchemaType
 	}
 
 	return &jsonschema.Type{
-		Ref: fmt.Sprintf("#/definitions/%s", typeName),
+		Ref: fmt.Sprintf("#/definitions/%s", cleanTypeName(typeName)),
 	}, nil
 }
 
@@ -638,16 +645,16 @@ func convertFile(file *descriptor.FileDescriptorProto) ([]*plugin.CodeGeneratorR
 			} else {
 				messageJSONSchema.Definitions = schemaDefinitions
 
-				messageJSONSchema.Version = jsonschema.Version
+				messageJSONSchema.Version = "http://json-schema.org/draft-07/schema#"
 
 				if addSchemaProperty {
 					if messageJSONSchema.Properties == nil {
-						messageJSONSchema.Properties = make(map[string]*jsonschema.Type)
+						messageJSONSchema.Properties = orderedmap.New()
 					}
-					messageJSONSchema.Properties["$schema"] = &jsonschema.Type{
+					messageJSONSchema.Properties.Set("$schema", &jsonschema.Type{
 						Type:   "string",
 						Format: "uri",
-					}
+					})
 				}
 
 				// Marshal the JSON-Schema into JSON:
