@@ -9,6 +9,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"github.com/alecthomas/jsonschema"
@@ -396,6 +397,7 @@ func convertField(curPkg *ProtoPackage, desc *descriptor.FieldDescriptorProto, m
 
 	// Recurse array of primitive types:
 	if isRepeated && jsonSchemaType.Type != gojsonschema.TYPE_OBJECT {
+
 		jsonSchemaType.Items = &jsonschema.Type{}
 
 		if len(jsonSchemaType.Enum) > 0 {
@@ -451,14 +453,19 @@ func convertField(curPkg *ProtoPackage, desc *descriptor.FieldDescriptorProto, m
 				return nil, false, fmt.Errorf("no such message type named %s", desc.GetTypeName())
 			}
 
-			// Recurse:
 			recursedJSONSchemaType, err := convertMessageType(curPkg, desc.GetTypeName(), recordType, definitions)
 			if err != nil {
 				return nil, false, err
 			}
 
-			// The result is stored differently for arrays of objects (they become "items"):
-			if desc.GetLabel() == descriptor.FieldDescriptorProto_LABEL_REPEATED {
+			if recordType.Options.GetMapEntry() {
+				if raw, err := json.Marshal(recursedJSONSchemaType); err != nil {
+					return nil, false, err
+				} else {
+					jsonSchemaType.AdditionalProperties = raw
+				}
+			} else if desc.GetLabel() == descriptor.FieldDescriptorProto_LABEL_REPEATED {
+				// The result is stored differently for arrays of objects (they become "items"):
 				jsonSchemaType.Items = recursedJSONSchemaType
 				jsonSchemaType.Type = gojsonschema.TYPE_ARRAY
 				jsonSchemaType.AdditionalProperties = nil
@@ -548,6 +555,17 @@ func convertMessageType(curPkg *ProtoPackage, typeName string, msg *descriptor.D
 				if required {
 					jsonSchemaType.Required = append(jsonSchemaType.Required, *fieldDesc.JsonName)
 				}
+			}
+		}
+
+		if msg.Options.GetMapEntry() {
+			// just return the ref to the value type
+			if value, has := jsonSchemaType.Properties.Get("value"); !has {
+				return nil, errors.New("missing value type")
+			} else if value, ok := value.(*jsonschema.Type); !ok {
+				return nil, errors.New("value type was not jsonschema.Type")
+			} else {
+				return value, nil
 			}
 		}
 
