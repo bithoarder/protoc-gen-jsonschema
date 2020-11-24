@@ -650,6 +650,32 @@ func convertFile(file *descriptor.FileDescriptorProto) ([]*plugin.CodeGeneratorR
 		if !ok {
 			return nil, fmt.Errorf("no such package found: %s", file.GetPackage())
 		}
+		for _, enum := range file.GetEnumType() {
+			jsonSchemaFileName := fmt.Sprintf("%s.schema.json", enum.GetName())
+			logWithLevel(LOG_INFO, "Generating JSON-schema for ENUM (%v) in file [%v] => %v", enum.GetName(), protoFileName, jsonSchemaFileName)
+
+			if schemaDefinition, err := convertEnumType(enum); err != nil {
+				logWithLevel(LOG_ERROR, "Failed to convert %s: %v", protoFileName, err)
+				return nil, err
+			} else {
+				schemaDefinition.Version = "http://json-schema.org/draft-07/schema#"
+
+				// Marshal the JSON-Schema into JSON:
+				jsonSchemaJSON, err := json.MarshalIndent(schemaDefinition, "", "    ")
+				if err != nil {
+					logWithLevel(LOG_ERROR, "Failed to encode jsonSchema: %v", err)
+					return nil, err
+				} else {
+					// Add a response:
+					resFile := &plugin.CodeGeneratorResponse_File{
+						Name:    proto.String(jsonSchemaFileName),
+						Content: proto.String(string(jsonSchemaJSON)),
+					}
+					response = append(response, resFile)
+				}
+			}
+		}
+
 		for _, msg := range file.GetMessageType() {
 			jsonSchemaFileName := fmt.Sprintf("%s.schema.json", msg.GetName())
 			logWithLevel(LOG_INFO, "Generating JSON-schema for MESSAGE (%v) in file [%v] => %v", msg.GetName(), protoFileName, jsonSchemaFileName)
